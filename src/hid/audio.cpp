@@ -22,6 +22,153 @@ static int32_t DMA_BUFFER_MEM_SECTION
 static int32_t DMA_BUFFER_MEM_SECTION
     dsy_audio_tx_buffer[kAudioMaxChannels / 2][kAudioMaxBufferSize];
 
+namespace
+{
+    constexpr uint32_t kSai2BridgeFrames = 512;
+    constexpr uint32_t kSai2BridgeMask   = kSai2BridgeFrames - 1;
+    constexpr uint32_t kSai2BridgeTarget = 96;
+
+    struct StereoFrame
+    {
+        float left;
+        float right;
+    };
+
+    struct Sai2Bridge
+    {
+        StereoFrame       rx[kSai2BridgeFrames];
+        StereoFrame       tx[kSai2BridgeFrames];
+        volatile uint32_t rx_write    = 0;
+        uint32_t          rx_read     = 0;
+        float             rx_fraction = 0.f;
+        bool              rx_primed   = false;
+        volatile uint32_t tx_write    = 0;
+        volatile uint32_t tx_read     = 0;
+        float             tx_fraction = 0.f;
+        bool              tx_primed   = false;
+    };
+
+    Sai2Bridge sai2_bridge;
+
+    inline void Sai2MemoryBarrier()
+    { __asm__ volatile("dmb" ::: "memory"); }
+
+    float ClampBridgeCorrection(float correction)
+    {
+        if(correction > 0.002f)
+            return 0.002f;
+        if(correction < -0.002f)
+            return -0.002f;
+        return correction;
+    }
+
+    StereoFrame ReadSai2Rx()
+    {
+        uint32_t write = sai2_bridge.rx_write;
+        Sai2MemoryBarrier();
+        uint32_t available = write - sai2_bridge.rx_read;
+        if(!sai2_bridge.rx_primed)
+        {
+            if(available < kSai2BridgeTarget + 2)
+                return {0.f, 0.f};
+            sai2_bridge.rx_read     = write - kSai2BridgeTarget;
+            sai2_bridge.rx_fraction = 0.f;
+            sai2_bridge.rx_primed   = true;
+            available               = kSai2BridgeTarget;
+        }
+        else if(available >= kSai2BridgeFrames - 2)
+        {
+            sai2_bridge.rx_read     = write - kSai2BridgeTarget;
+            sai2_bridge.rx_fraction = 0.f;
+            available               = kSai2BridgeTarget;
+        }
+
+        if(available < 2)
+            return {0.f, 0.f};
+
+        const StereoFrame& a
+            = sai2_bridge.rx[sai2_bridge.rx_read & kSai2BridgeMask];
+        const StereoFrame& b
+            = sai2_bridge.rx[(sai2_bridge.rx_read + 1) & kSai2BridgeMask];
+        const float fraction = sai2_bridge.rx_fraction;
+        StereoFrame result   = {a.left + (b.left - a.left) * fraction,
+                                a.right + (b.right - a.right) * fraction};
+
+        float fill_error = static_cast<float>(available)
+                           - static_cast<float>(kSai2BridgeTarget);
+        float correction = ClampBridgeCorrection(fill_error * 0.00001f);
+        sai2_bridge.rx_fraction += 1.f + correction;
+        uint32_t advance = static_cast<uint32_t>(sai2_bridge.rx_fraction);
+        sai2_bridge.rx_read += advance;
+        sai2_bridge.rx_fraction -= advance;
+        return result;
+    }
+
+    void WriteSai2Tx(float left, float right)
+    {
+        uint32_t write = sai2_bridge.tx_write;
+        if(write - sai2_bridge.tx_read >= kSai2BridgeFrames - 1)
+            return;
+        sai2_bridge.tx[write & kSai2BridgeMask] = {left, right};
+        Sai2MemoryBarrier();
+        sai2_bridge.tx_write = write + 1;
+    }
+
+    StereoFrame ReadSai2Tx()
+    {
+        uint32_t write = sai2_bridge.tx_write;
+        Sai2MemoryBarrier();
+        uint32_t available = write - sai2_bridge.tx_read;
+        if(!sai2_bridge.tx_primed)
+        {
+            if(available < kSai2BridgeTarget + 2)
+                return {0.f, 0.f};
+            sai2_bridge.tx_read     = write - kSai2BridgeTarget;
+            sai2_bridge.tx_fraction = 0.f;
+            sai2_bridge.tx_primed   = true;
+            available               = kSai2BridgeTarget;
+        }
+        else if(available >= kSai2BridgeFrames - 2)
+        {
+            sai2_bridge.tx_read     = write - kSai2BridgeTarget;
+            sai2_bridge.tx_fraction = 0.f;
+            available               = kSai2BridgeTarget;
+        }
+
+        if(available < 2)
+            return {0.f, 0.f};
+
+        const StereoFrame& a
+            = sai2_bridge.tx[sai2_bridge.tx_read & kSai2BridgeMask];
+        const StereoFrame& b
+            = sai2_bridge.tx[(sai2_bridge.tx_read + 1) & kSai2BridgeMask];
+        const float fraction = sai2_bridge.tx_fraction;
+        StereoFrame result   = {a.left + (b.left - a.left) * fraction,
+                                a.right + (b.right - a.right) * fraction};
+
+        float fill_error = static_cast<float>(available)
+                           - static_cast<float>(kSai2BridgeTarget);
+        float correction = ClampBridgeCorrection(fill_error * 0.00001f);
+        sai2_bridge.tx_fraction += 1.f + correction;
+        uint32_t advance = static_cast<uint32_t>(sai2_bridge.tx_fraction);
+        sai2_bridge.tx_read += advance;
+        sai2_bridge.tx_fraction -= advance;
+        return result;
+    }
+
+    void ResetSai2Bridge()
+    {
+        sai2_bridge.rx_write    = 0;
+        sai2_bridge.rx_read     = 0;
+        sai2_bridge.rx_fraction = 0.f;
+        sai2_bridge.rx_primed   = false;
+        sai2_bridge.tx_write    = 0;
+        sai2_bridge.tx_read     = 0;
+        sai2_bridge.tx_fraction = 0.f;
+        sai2_bridge.tx_primed   = false;
+    }
+} // namespace
+
 // ================================================================
 // Private Implementation Definition
 // ================================================================
@@ -84,6 +231,7 @@ class AudioHandle::Impl
 
     // Internal Callback
     static void InternalCallback(int32_t* in, int32_t* out, size_t size);
+    static void Sai2BridgeCallback(int32_t* in, int32_t* out, size_t size);
 
     void *callback_, *interleaved_callback_;
 
@@ -172,9 +320,11 @@ AudioHandle::Impl::Start(AudioHandle::AudioCallback callback)
     // Get instance of object
     if(sai2_.IsInitialized())
     {
-        // Start stream with no callback. Data will be filled externally.
-        sai2_.StartDma(
-            buff_rx_[1], buff_tx_[1], config_.blocksize * 2 * 2, nullptr);
+        ResetSai2Bridge();
+        sai2_.StartDma(buff_rx_[1],
+                       buff_tx_[1],
+                       config_.blocksize * 2 * 2,
+                       Sai2BridgeCallback);
     }
     sai1_.StartDma(buff_rx_[0],
                    buff_tx_[0],
@@ -350,9 +500,7 @@ void AudioHandle::Impl::InternalCallback(int32_t* in, int32_t* out, size_t size)
     }
     else if(audio_handle.callback_)
     {
-        AudioCallback cb = (AudioCallback)audio_handle.callback_;
-        // offset needed for 2nd audio codec.
-        size_t offset    = audio_handle.sai2_.GetOffset();
+        AudioCallback cb        = (AudioCallback)audio_handle.callback_;
         size_t buff_size = chns > 2 ? size * 2 : size;
         float  finbuff[buff_size], foutbuff[buff_size];
         float* fin[chns];
@@ -377,15 +525,6 @@ void AudioHandle::Impl::InternalCallback(int32_t* in, int32_t* out, size_t size)
                     fin[0][i / 2] = s162f(in[i]) * audio_handle.postgain_recip_;
                     fin[1][i / 2]
                         = s162f(in[i + 1]) * audio_handle.postgain_recip_;
-                    if(chns > 2)
-                    {
-                        fin[2][i / 2]
-                            = s162f(audio_handle.buff_rx_[1][offset + i])
-                              * audio_handle.postgain_recip_;
-                        fin[3][i / 2]
-                            = s162f(audio_handle.buff_rx_[1][offset + i + 1])
-                              * audio_handle.postgain_recip_;
-                    }
                 }
                 break;
             case SaiHandle::Config::BitDepth::SAI_24BIT:
@@ -394,15 +533,6 @@ void AudioHandle::Impl::InternalCallback(int32_t* in, int32_t* out, size_t size)
                     fin[0][i / 2] = s242f(in[i]) * audio_handle.postgain_recip_;
                     fin[1][i / 2]
                         = s242f(in[i + 1]) * audio_handle.postgain_recip_;
-                    if(chns > 2)
-                    {
-                        fin[2][i / 2]
-                            = s242f(audio_handle.buff_rx_[1][offset + i])
-                              * audio_handle.postgain_recip_;
-                        fin[3][i / 2]
-                            = s242f(audio_handle.buff_rx_[1][offset + i + 1])
-                              * audio_handle.postgain_recip_;
-                    }
                 }
                 break;
             case SaiHandle::Config::BitDepth::SAI_32BIT:
@@ -411,18 +541,18 @@ void AudioHandle::Impl::InternalCallback(int32_t* in, int32_t* out, size_t size)
                     fin[0][i / 2] = s322f(in[i]) * audio_handle.postgain_recip_;
                     fin[1][i / 2]
                         = s322f(in[i + 1]) * audio_handle.postgain_recip_;
-                    if(chns > 2)
-                    {
-                        fin[2][i / 2]
-                            = s322f(audio_handle.buff_rx_[1][offset + i])
-                              * audio_handle.postgain_recip_;
-                        fin[3][i / 2]
-                            = s322f(audio_handle.buff_rx_[1][offset + i + 1])
-                              * audio_handle.postgain_recip_;
-                    }
                 }
                 break;
             default: break;
+        }
+        if(chns > 2)
+        {
+            for(size_t frame = 0; frame < size / 2; ++frame)
+            {
+                StereoFrame sample = ReadSai2Rx();
+                fin[2][frame]      = sample.left * audio_handle.postgain_recip_;
+                fin[3][frame] = sample.right * audio_handle.postgain_recip_;
+            }
         }
         cb(fin, fout, size / 2);
         // Reinterleave and scale
@@ -435,13 +565,6 @@ void AudioHandle::Impl::InternalCallback(int32_t* in, int32_t* out, size_t size)
                         = f2s16(fout[0][i / 2] * audio_handle.output_adjust_);
                     out[i + 1]
                         = f2s16(fout[1][i / 2] * audio_handle.output_adjust_);
-                    if(chns > 2)
-                    {
-                        audio_handle.buff_tx_[1][offset + i] = f2s16(
-                            fout[2][i / 2] * audio_handle.output_adjust_);
-                        audio_handle.buff_tx_[1][offset + i + 1] = f2s16(
-                            fout[3][i / 2] * audio_handle.output_adjust_);
-                    }
                 }
                 break;
             case SaiHandle::Config::BitDepth::SAI_24BIT:
@@ -451,13 +574,6 @@ void AudioHandle::Impl::InternalCallback(int32_t* in, int32_t* out, size_t size)
                         = f2s24(fout[0][i / 2] * audio_handle.output_adjust_);
                     out[i + 1]
                         = f2s24(fout[1][i / 2] * audio_handle.output_adjust_);
-                    if(chns > 2)
-                    {
-                        audio_handle.buff_tx_[1][offset + i] = f2s24(
-                            fout[2][i / 2] * audio_handle.output_adjust_);
-                        audio_handle.buff_tx_[1][offset + i + 1] = f2s24(
-                            fout[3][i / 2] * audio_handle.output_adjust_);
-                    }
                 }
                 break;
             case SaiHandle::Config::BitDepth::SAI_32BIT:
@@ -467,17 +583,40 @@ void AudioHandle::Impl::InternalCallback(int32_t* in, int32_t* out, size_t size)
                         = f2s32(fout[0][i / 2] * audio_handle.output_adjust_);
                     out[i + 1]
                         = f2s32(fout[1][i / 2] * audio_handle.output_adjust_);
-                    if(chns > 2)
-                    {
-                        audio_handle.buff_tx_[1][offset + i] = f2s32(
-                            fout[2][i / 2] * audio_handle.output_adjust_);
-                        audio_handle.buff_tx_[1][offset + i + 1] = f2s32(
-                            fout[3][i / 2] * audio_handle.output_adjust_);
-                    }
                 }
                 break;
             default: break;
         }
+        if(chns > 2)
+        {
+            for(size_t frame = 0; frame < size / 2; ++frame)
+            {
+                WriteSai2Tx(fout[2][frame] * audio_handle.output_adjust_,
+                            fout[3][frame] * audio_handle.output_adjust_);
+            }
+        }
+    }
+}
+
+void AudioHandle::Impl::Sai2BridgeCallback(int32_t* in,
+                                           int32_t* out,
+                                           size_t   size)
+{
+    const size_t frames = size / 2;
+    uint32_t     write  = sai2_bridge.rx_write;
+    for(size_t frame = 0; frame < frames; ++frame)
+    {
+        sai2_bridge.rx[(write + frame) & kSai2BridgeMask]
+            = {s162f(in[frame * 2]), s162f(in[frame * 2 + 1])};
+    }
+    Sai2MemoryBarrier();
+    sai2_bridge.rx_write = write + frames;
+
+    for(size_t frame = 0; frame < frames; ++frame)
+    {
+        StereoFrame sample = ReadSai2Tx();
+        out[frame * 2]     = f2s16(sample.left);
+        out[frame * 2 + 1] = f2s16(sample.right);
     }
 }
 
