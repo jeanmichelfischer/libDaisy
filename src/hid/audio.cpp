@@ -46,6 +46,10 @@ namespace
         volatile uint32_t tx_read     = 0;
         float             tx_fraction = 0.f;
         bool              tx_primed   = false;
+        volatile uint32_t rx_underflows = 0;
+        volatile uint32_t rx_overruns   = 0;
+        volatile uint32_t tx_underflows = 0;
+        volatile uint32_t tx_overruns   = 0;
     };
 
     Sai2Bridge sai2_bridge;
@@ -78,13 +82,17 @@ namespace
         }
         else if(available >= kSai2BridgeFrames - 2)
         {
+            ++sai2_bridge.rx_overruns;
             sai2_bridge.rx_read     = write - kSai2BridgeTarget;
             sai2_bridge.rx_fraction = 0.f;
             available               = kSai2BridgeTarget;
         }
 
         if(available < 2)
+        {
+            ++sai2_bridge.rx_underflows;
             return {0.f, 0.f};
+        }
 
         const StereoFrame& a
             = sai2_bridge.rx[sai2_bridge.rx_read & kSai2BridgeMask];
@@ -108,7 +116,10 @@ namespace
     {
         uint32_t write = sai2_bridge.tx_write;
         if(write - sai2_bridge.tx_read >= kSai2BridgeFrames - 1)
+        {
+            ++sai2_bridge.tx_overruns;
             return;
+        }
         sai2_bridge.tx[write & kSai2BridgeMask] = {left, right};
         Sai2MemoryBarrier();
         sai2_bridge.tx_write = write + 1;
@@ -130,13 +141,18 @@ namespace
         }
         else if(available >= kSai2BridgeFrames - 2)
         {
+            ++sai2_bridge.tx_overruns;
             sai2_bridge.tx_read     = write - kSai2BridgeTarget;
             sai2_bridge.tx_fraction = 0.f;
             available               = kSai2BridgeTarget;
         }
 
         if(available < 2)
+        {
+            if(sai2_bridge.tx_primed)
+                ++sai2_bridge.tx_underflows;
             return {0.f, 0.f};
+        }
 
         const StereoFrame& a
             = sai2_bridge.tx[sai2_bridge.tx_read & kSai2BridgeMask];
@@ -166,6 +182,10 @@ namespace
         sai2_bridge.tx_read     = 0;
         sai2_bridge.tx_fraction = 0.f;
         sai2_bridge.tx_primed   = false;
+        sai2_bridge.rx_underflows = 0;
+        sai2_bridge.rx_overruns   = 0;
+        sai2_bridge.tx_underflows = 0;
+        sai2_bridge.tx_overruns   = 0;
     }
 } // namespace
 
@@ -206,6 +226,14 @@ class AudioHandle::Impl
     }
 
     float GetSampleRate() { return sai1_.GetSampleRate(); }
+
+    AudioHandle::Sai2BridgeStats GetSai2BridgeStats() const
+    {
+        return {sai2_bridge.rx_underflows,
+                sai2_bridge.rx_overruns,
+                sai2_bridge.tx_underflows,
+                sai2_bridge.tx_overruns};
+    }
 
     AudioHandle::Result SetPostGain(float val)
     {
@@ -663,6 +691,9 @@ float AudioHandle::GetSampleRate()
 {
     return pimpl_->GetSampleRate();
 }
+
+AudioHandle::Sai2BridgeStats AudioHandle::GetSai2BridgeStats() const
+{ return pimpl_->GetSai2BridgeStats(); }
 
 AudioHandle::Result
 AudioHandle::SetSampleRate(SaiHandle::Config::SampleRate samplerate)
